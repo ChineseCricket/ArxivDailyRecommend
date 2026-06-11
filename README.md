@@ -1,5 +1,7 @@
 # arXiv Daily Briefing
 
+[![中文](https://img.shields.io/badge/中文-README_CN-blue)](README_CN.md)
+
 Personalized arXiv daily briefing for astrophysics & superconducting detectors.  
 Fetches new submissions from arXiv RSS feeds, classifies them with LLMs, and delivers a curated briefing.
 

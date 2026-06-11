@@ -1,5 +1,7 @@
 # arXiv 每日简报
 
+[![English](https://img.shields.io/badge/English-README-blue)](README.md)
+
 基于 arXiv RSS 的天体物理 & 超导探测器每日论文推送。自动抓取最新投稿，用大模型分类打分，生成个性化简报。
 
 ## 覆盖范围
