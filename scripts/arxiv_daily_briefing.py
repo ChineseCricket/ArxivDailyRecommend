@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""arXiv Daily Briefing — Astrophysics & Superconducting Detectors
+Uses RSS feeds for reliable data fetching, LLM for classification.
+Falls back through: proxy → z.ai → DeepSeek (each with 30s timeout).
+"""
+
+import urllib.request
+import xml.etree.ElementTree as ET
+import json
+import time
+import sys
+import os
+import re
+from datetime import datetime, timedelta, timezone
+
+# Load .env for API keys
+from pathlib import Path
+_dotenv = Path.home() / ".hermes" / ".env"
+if _dotenv.exists():
+    for _line in _dotenv.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+# === Configuration ===
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+# LLM endpoints (tried in order)
+# Endpoint priority: proxy first (free NVIDIA NIM when alive), then z.ai, then DeepSeek (paid).
+# The adaptive mechanism in classify_batch() will demote proxy to last if it times out,
+# so NVIDIA-dead days only sacrifice ONE batch (~30s) instead of all batches (~5min).
+LLM_ENDPOINTS = [
+    {
+        "name": "Waterfall Proxy",
+        "url": "http://localhost:18900/v1/chat/completions",
+        "key": None,  # Proxy handles auth internally
+        "model": "moonshotai/kimi-k2.6",
+    },
+    {
+        "name": "DeepSeek",
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "key": os.environ.get("DEEPSEEK_API_KEY") or "sk-YOUR_DEEPSEEK_KEY_HERE",
+        "model": "deepseek-v4-pro",
+    },
+    {
+        "name": "z.ai GLM-5-turbo",
+        "url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+        "key": os.environ.get("GLM_API_KEY") or "YOUR_GLM_KEY_HERE",
+        "model": "glm-5-turbo",
+    },
+]
+
+# Adaptive endpoint ordering — modified at runtime by the probe mechanism.
+# Starts as [0,1,2] (proxy first). If proxy times out on first batch,
+# demoted to [1,2,0] (z.ai → DeepSeek → proxy) for remaining batches.
+_endpoint_order = list(range(len(LLM_ENDPOINTS)))
+_first_demoted = False
+MAX_RETRIES = 3
+RETRY_INTERVAL = 3600  # 1 hour
+CACHE_DIR = os.path.expanduser("~/.hermes/cron/arxiv_briefing")
+
+# RSS feeds to fetch
+RSS_FEEDS = [
+    "astro-ph",          # All astrophysics
+    "physics.ins-det",   # Instruments & detectors
+    "cond-mat.supr-con", # Superconductivity
+]
+
+# Only keep "new" type papers from these feeds.
+# For physics.ins-det and cond-mat.supr-con, also filter by keywords
+# Uses regex word-boundary matching (\\b) for abbreviations to avoid
+# false positives (e.g. "tes" matching "states", "nes" matching "tunneling").
+DETECTOR_KEYWORDS_PATTERNS = [
+    # Full phrases (substring match is fine — distinctive enough)
+    r"superconducting detector", r"transition-edge", r"microcalorimeter",
+    r"bolometer", r"cryogenic detector", r"mm-wave detector",
+    r"submillimeter detector", r"cmb detector", r"photon noise",
+    r"noise equivalent", r"kinetic inductance", r"multiplex",
+    r"readout", r"mu-metal",
+    # Abbreviations — word-boundary to avoid false matches
+    r"\bTES\b", r"\bMKID\b", r"\bKID\b", r"\bSQUID\b",
+    r"\bNES\b", r"\bNEP\b",
+    # Compound terms with abbreviations
+    r"\bTES\b.*(?:microcalorimeter|bolometer|detector|array|sensor)",
+    r"\bKID\b.*(?:array|detector|sensor)",
+]
+
+# Interest domains with weights
+INTEREST_DOMAINS = [
+    {"name": "超导探测器及其读出技术", "tag": "🔬超导探测器", "weight": 5,
+     "keywords": ["superconducting detector", "transition-edge sensor",
+                   "kinetic inductance", "microwave squid", "multiplexing",
+                   "frequency division multiplex", "fdm", "tdm", "readout",
+                   "mu-metal", "detector array", "bolometer", "microcalorimeter",
+                   "mm-wave detector", "sub-mm detector", "cmb detector",
+                   "photon noise", "noise equivalent power"]},
+    {"name": "弥散热气体", "tag": "🌫️热气体", "weight": 4,
+     "keywords": ["warm-hot igm", "whim", "circumgalactic medium", "cgm",
+                   "hot halo", "diffuse x-ray", "ovii", "oviii",
+                   "absorption line", "baryon", "missing baryon", "hot gas",
+                   "intergalactic medium", "intracluster medium",
+                   "hot circumgalactic", "diffuse baryon"]},
+    {"name": "天文仪器与技术", "tag": "🔭天文仪器", "weight": 3,
+     "keywords": ["instrumentation", "telescope design", "spectrograph",
+                   "optics", "calibration", "adaptive optics", "interferometry",
+                   "coronagraph", "integral field unit", "ifu",
+                   "telescope optics", "mirror", "focal plane"]},
+    {"name": "X射线观测恒星与行星系统相互作用", "tag": "⭐X射线恒星行星", "weight": 2,
+     "keywords": ["star-planet interaction", "x-ray transit",
+                   "coronal mass ejection", "stellar wind",
+                   "exoplanet x-ray", "flare star", "magnetosphere planet",
+                   "planetary atmosphere erosion", "x-ray emission host star",
+                   "x-ray stellar", "stellar flare", "stellar activity",
+                   "atmospheric escape", "space weather",
+                   "high-energy radiation planet"]},
+    {"name": "宜居世界搜索与地外生命", "tag": "🌍宜居世界", "weight": 1,
+     "keywords": ["habitable zone", "biosignature", "technosignature",
+                   "exoplanet atmosphere characterization", "transit spectroscopy",
+                   "life detection", "habitable world", "biomarker",
+                   "atmospheric escape", "habitable exoplanet"]},
+]
+
+
+def fetch_rss_feed(category):
+    """Fetch and parse an arXiv RSS feed."""
+    url = f"https://export.arxiv.org/rss/{category}"
+    req = urllib.request.Request(url, headers={"User-Agent": "arxiv-daily-briefing/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode("utf-8")
+
+
+def parse_rss_items(xml_data, feed_category, keyword_filter=False):
+    """Parse RSS items into paper dicts. Optionally filter by detector keywords."""
+    root = ET.fromstring(xml_data)
+    papers = []
+
+    for item in root.findall('.//item'):
+        title = item.find('title').text.strip().replace('\n', ' ')
+        link = item.find('link').text.strip()
+        desc = item.find('description').text or ''
+
+        # Extract arXiv ID from link
+        arxiv_id = link.split('/abs/')[-1] if '/abs/' in link else ''
+        if not arxiv_id:
+            continue
+        base_id = arxiv_id.split('v')[0]
+
+        # Determine announce type
+        announce_type = 'other'
+        if 'Announce Type: new' in desc:
+            announce_type = 'new'
+        elif 'Announce Type: cross' in desc:
+            announce_type = 'cross'
+        elif 'Announce Type: rep' in desc:
+            announce_type = 'replaced'
+
+        # Only keep new submissions (not cross-listed or replaced)
+        if announce_type != 'new':
+            continue
+
+        # Extract abstract from description
+        abstract = ''
+        abs_match = re.search(r'Abstract:\s*(.*)', desc, re.DOTALL)
+        if abs_match:
+            abstract = abs_match.group(1).strip()
+            # Clean LaTeX artifacts
+            abstract = re.sub(r'\$[^$]*\$', '', abstract)
+            abstract = abstract.replace('\n', ' ').strip()[:500]
+
+        # Keyword filter for non-astro-ph feeds (regex word-boundary matching)
+        if keyword_filter:
+            text = title + ' ' + abstract
+            if not any(re.search(pat, text, re.IGNORECASE) for pat in DETECTOR_KEYWORDS_PATTERNS):
+                continue
+
+        papers.append({
+            'id': base_id,
+            'title': title,
+            'abstract': abstract,
+            'feed_category': feed_category,
+            'url': f"https://arxiv.org/abs/{base_id}",
+        })
+
+    return papers
+
+
+def fetch_all_papers():
+    """Fetch papers from all RSS feeds."""
+    all_papers = []
+    for feed in RSS_FEEDS:
+        try:
+            print(f"  Fetching {feed}...", file=sys.stderr)
+            xml_data = fetch_rss_feed(feed)
+            is_keyword = feed not in ("astro-ph",)
+            papers = parse_rss_items(xml_data, feed, keyword_filter=is_keyword)
+            print(f"    {len(papers)} new papers from {feed}", file=sys.stderr)
+            all_papers.extend(papers)
+            time.sleep(2)  # Be nice to arXiv
+        except Exception as e:
+            print(f"    Warning: {feed} fetch failed: {e}", file=sys.stderr)
+
+    return deduplicate(all_papers)
+
+
+def deduplicate(papers):
+    """Remove duplicates by base arXiv ID."""
+    seen = set()
+    unique = []
+    for p in papers:
+        if p['id'] not in seen:
+            seen.add(p['id'])
+            unique.append(p)
+    return unique
+
+
+def get_feed_date():
+    """Get the publication date (pubDate) from the RSS feed. Returns a datetime in Beijing TZ."""
+    try:
+        xml_data = fetch_rss_feed("astro-ph")
+        root = ET.fromstring(xml_data)
+        # Use first item's pubDate — they're all the same within a daily feed
+        pub = root.find('.//pubDate')
+        if pub is not None and pub.text:
+            # Parse: "Tue, 12 May 2026 00:00:00 -0400"
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(pub.text.strip())
+            return dt.astimezone(BEIJING_TZ)
+    except:
+        pass
+    return None
+
+
+def is_feed_today():
+    """Check if the RSS feed contains today's papers (Beijing date)."""
+    feed_dt = get_feed_date()
+    if feed_dt is None:
+        return False, None
+    now_beijing = datetime.now(BEIJING_TZ)
+    # arXiv RSS pubDate is US-Eastern midnight (00:00 -0400), which equals
+    # Beijing noon of the *previous* day.  Papers actually go live at ~20:00 ET
+    # (= ~08:00 Beijing next day), so the RSS date is always 1 day behind
+    # Beijing when papers are fresh.  Accept feed_date == today OR yesterday.
+    is_today = feed_dt.date() >= (now_beijing.date() - timedelta(days=1))
+    return is_today, feed_dt.strftime("%Y-%m-%d %H:%M 北京时间")
+
+
+def classify_batch(papers_batch, batch_idx, total_batches):
+    """Send a batch of papers to LLM for classification via multi-endpoint fallback."""
+    global _endpoint_order, _proxy_demoted
+
+    paper_texts = []
+    for i, p in enumerate(papers_batch):
+        paper_texts.append(
+            f"[P{i+1}] ID: {p['id']}\n"
+            f"Feed: {p.get('feed_category', '?')}\n"
+            f"Title: {p['title']}\n"
+            f"Abstract: {p['abstract']}"
+        )
+
+    domain_desc = "\n".join(
+        f"  - {d['name']} (权重×{d['weight']})"
+        for d in INTEREST_DOMAINS
+    )
+
+    prompt = f"""你是天体物理学与超导探测器技术领域的资深专家。请分析以下 {len(papers_batch)} 篇 arXiv 新投稿论文。
+
+对每篇论文完成：
+
+1. **重要性分级**（严格四选一）：
+   - Tier-1: 重大突破 — 新物理发现、颠覆性技术、里程碑式观测成果（极其罕见，真正改变领域认知的工作）
+   - Tier-2: 重要综述/重要进展 — 高质量综述论文、长期项目重要里程碑、重要方法学突破
+   - Tier-3: 项目更新 — 合作组常规进展、已知方法增量改进、初步结果
+   - Tier-4: 一般工作报告 — 常规观测报告、技术报告、小规模分析
+
+   注意：Tier-1 门槛极高，只有真正的突破性成果才能标记。绝大部分论文应为 Tier-3 或 Tier-4。
+
+2. **兴趣领域相关度**（每个领域 0-3 分：0=无关 1=略微相关 2=相关 3=高度相关）：
+{domain_desc}
+
+   ⚠️ 重要排除规则：「超导探测器及其读出技术」领域仅关注**探测器器件与读出系统**本身，不包括纯凝聚态超导理论研究。以下主题即使来自cond-mat.supr-con也应评为0分：
+   - 超导配对机制、BCS理论、非常规超导机理（如拓扑超导、马约拉纳费米子用于量子计算）
+   - 高温超导体材料性质（铜氧化物、铁基、镍基等合成与表征）
+   - 涡旋物理、磁通钉扎、临界电流、磁化率测量
+   - 约瑟夫森结用于量子比特/量子计算（但量子比特的低温读出与多路复用技术**属于该领域**，应正常打分）
+   - 超导薄膜/异质结生长（除非明确用于探测器制造）
+   - Ising超导、拓扑超导、自旋三重态配对等纯基础物理
+
+   以下属于该领域，应正常打分：TES/MKID/KID/SQUID探测器、微卡计、辐射热计、低温探测器阵列、多路复用读出、超导纳米线单光子探测器(SNSPD)、mm波/亚mm波探测器、CMB探测器、X射线/γ射线超导探测器、量子比特低温读出与多路复用。
+
+   ⚠️ 同理，「X射线观测恒星与行星系统相互作用」仅关注**恒星活动对行星系统的高能辐射影响**。以下即使涉及X射线也应评为0分：
+   - 超亮X射线源(ULX)、X射线双星、AGN/活动星系核的X射线辐射
+   - 中子星/黑洞吸积（除非明确涉及行星磁层/大气）
+   - 星系团/星系尺度弥散X射线（属于「弥散热气体」，不属本领域）
+   以下属于该领域，应正常打分：恒星耀斑/CME对行星大气的X射线剥离、行星X射线凌日、恒星星风与行星磁层相互作用、主星X射线辐射对行星大气演化的影响。
+
+3. **一句话中文简介**（40-60字，概括最重要的创新点和结果，简洁精准）
+
+严格返回纯JSON数组（不要markdown代码块标记、不要额外解释）：
+[
+  {{
+    "paper_index": 1,
+    "tier": "Tier-1",
+    "relevance": {{
+      "超导探测器及其读出技术": 0,
+      "弥散热气体": 0,
+      "天文仪器与技术": 0,
+      "X射线观测恒星与行星系统相互作用": 0,
+      "宜居世界搜索与地外生命": 0
+    }},
+    "summary_cn": "一句话中文简介"
+  }}
+]
+
+论文列表：
+{chr(10).join(paper_texts)}"""
+
+    messages = [
+        {"role": "system", "content": "你是天体物理学和探测器技术领域的专家评审。只返回纯JSON数组，不要任何额外文字、解释或markdown标记。"},
+        {"role": "user", "content": prompt}
+    ]
+
+    # Try endpoints in current _endpoint_order with 60s timeout each
+    global _first_demoted, _endpoint_order
+    for ep_idx in _endpoint_order:
+        endpoint = LLM_ENDPOINTS[ep_idx]
+        payload = {
+            "model": endpoint["model"],
+            "messages": messages,
+            "stream": False,
+            "temperature": 0.2,
+        }
+        headers = {"Content-Type": "application/json"}
+        if endpoint.get("key"):
+            headers["Authorization"] = f"Bearer {endpoint['key']}"
+
+        req = urllib.request.Request(
+            endpoint["url"],
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            content = result['choices'][0]['message']['content'].strip()
+            for prefix in ("```json", "```"):
+                if content.startswith(prefix):
+                    content = content.split("\n", 1)[1] if "\n" in content else content[len(prefix):]
+            if content.endswith("```"):
+                content = content.rsplit("```", 1)[0]
+            parsed = json.loads(content.strip())
+            print(f"    → {endpoint['name']} OK", file=sys.stderr)
+            return parsed
+        except Exception as e:
+            print(f"    → {endpoint['name']} failed: {e}", file=sys.stderr)
+            # If the first-priority endpoint fails, demote it to last 
+            # for remaining batches (adaptive fallback)
+            if ep_idx == 0 and not _first_demoted:
+                _endpoint_order = _endpoint_order[1:] + [0]
+                _first_demoted = True
+                print(f"    → {endpoint['name']} demoted to last priority for remaining batches", file=sys.stderr)
+            continue
+
+    return None
+
+
+def compute_weighted_score(analysis):
+    """Compute weighted interest score."""
+    total = 0
+    rel = analysis.get('relevance', {})
+    for domain in INTEREST_DOMAINS:
+        total += rel.get(domain['name'], 0) * domain['weight']
+    return total
+
+
+def filter_papers(papers_with_analysis):
+    """Apply filtering rules to select papers for the briefing."""
+    tiers = {"Tier-1": [], "Tier-2": [], "Tier-3": [], "Tier-4": []}
+    for paper, analysis in papers_with_analysis:
+        tier = analysis.get('tier', 'Tier-4')
+        if tier not in tiers:
+            tier = 'Tier-4'
+        analysis['weighted_score'] = compute_weighted_score(analysis)
+        tiers[tier].append((paper, analysis))
+
+    selected = []
+
+    # Rule 1: All Tier-1
+    selected.extend(tiers["Tier-1"])
+
+    # Rule 2: Tier-2 with any interest (score > 0)
+    for paper, analysis in tiers["Tier-2"]:
+        if analysis['weighted_score'] > 0:
+            selected.append((paper, analysis))
+
+    # Rule 3: Tier-3 and Tier-4 top 10% by weighted score
+    lower = tiers["Tier-3"] + tiers["Tier-4"]
+    if lower:
+        lower.sort(key=lambda x: x[1]['weighted_score'], reverse=True)
+        count = max(1, len(lower) // 10)
+        selected.extend(lower[:count])
+
+    return selected
+
+
+def format_briefing(selected, total_fetched):
+    """Format the final markdown briefing."""
+    now_bj = datetime.now(BEIJING_TZ)
+    date_str = now_bj.strftime("%Y-%m-%d")
+
+    lines = [
+        f"📄 **arXiv 天体物理日报** | {date_str}",
+        "",
+        f"📊 今日扫描 {total_fetched} 篇新投稿，入选 {len(selected)} 篇",
+        "",
+    ]
+
+    tier_labels = [
+        ("Tier-1", "🔴 重大突破"),
+        ("Tier-2", "🟠 重要综述/重要进展"),
+        ("Tier-3", "🟡 项目更新（精选）"),
+        ("Tier-4", "⚪ 一般工作报告（精选）"),
+    ]
+
+    for tier_key, tier_label in tier_labels:
+        tier_papers = [(p, a) for p, a in selected if a.get('tier') == tier_key]
+        if not tier_papers:
+            continue
+        tier_papers.sort(key=lambda x: x[1]['weighted_score'], reverse=True)
+        lines.append(f"━━━ {tier_label} ━━━")
+        lines.append("")
+        for i, (paper, analysis) in enumerate(tier_papers, 1):
+            summary = analysis.get('summary_cn', '（无简介）')
+            # Find best matching domain tag
+            rel = analysis.get('relevance', {})
+            best_domains = sorted(
+                [(d, rel.get(d['name'], 0)) for d in INTEREST_DOMAINS],
+                key=lambda x: x[1], reverse=True
+            )
+            top_tags = [d['tag'] for d, score in best_domains if score >= 2]
+            tag_str = ' '.join(top_tags) + ' | ' if top_tags else ''
+            lines.append(f"**{i}.** {tag_str}{paper['title']}")
+            lines.append(f"💡 {summary}")
+            lines.append(f"🔗 {paper['url']}")
+            lines.append("")
+
+    # Domain stats
+    lines.append("━━ 📊 领域覆盖 ━━")
+    for domain in INTEREST_DOMAINS:
+        count = sum(1 for p, a in selected
+                    if a.get('relevance', {}).get(domain['name'], 0) >= 2)
+        if count > 0:
+            lines.append(f"  {domain['name']}: {count} 篇")
+
+    return "\n".join(lines)
+
+
+def _reported_ids_file():
+    """Return today's dated reported-IDs file path (per-day isolation)."""
+    today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+    return os.path.join(CACHE_DIR, f"reported_ids_{today}.json")
+
+
+def load_reported_ids():
+    """Load previously reported paper IDs (today only)."""
+    cache_file = _reported_ids_file()
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file) as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def save_reported_ids(ids):
+    """Save reported paper IDs to today's dated file."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = _reported_ids_file()
+    with open(cache_file, 'w') as f:
+        json.dump(sorted(list(ids)), f)
+    # Prune stale reported-IDs files older than 7 days
+    _prune_stale_ids()
+
+
+def _prune_stale_ids():
+    """Remove reported-IDs files older than 7 days to prevent accumulation."""
+    try:
+        cutoff = datetime.now(BEIJING_TZ) - timedelta(days=7)
+        for fname in os.listdir(CACHE_DIR):
+            if not fname.startswith("reported_ids_") or not fname.endswith(".json"):
+                continue
+            # Parse date from filename: reported_ids_YYYY-MM-DD.json
+            date_str = fname[len("reported_ids_"):-len(".json")]
+            try:
+                file_date = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                    tzinfo=BEIJING_TZ
+                )
+                if file_date.date() < cutoff.date():
+                    os.remove(os.path.join(CACHE_DIR, fname))
+            except (ValueError, OSError):
+                pass
+    except OSError:
+        pass
+
+
+def main():
+    force = any(a.startswith("--force") for a in sys.argv)
+    cron_mode = "--cron" in sys.argv
+
+    now_beijing = datetime.now(BEIJING_TZ)
+
+    # === Cron mode: check retry state ===
+    if cron_mode:
+        state_file = os.path.join(CACHE_DIR, "retry_state.json")
+        today_str = now_beijing.strftime("%Y-%m-%d")
+        cutoff_beijing = now_beijing.replace(hour=15, minute=0, second=0, microsecond=0)
+
+        state = {}
+        if os.path.exists(state_file):
+            try:
+                with open(state_file) as f:
+                    state = json.load(f)
+            except:
+                pass
+        if state.get("date") != today_str:
+            state = {"date": today_str, "done": False, "notified_hours": []}
+
+        # Already reported today — silent exit
+        if state.get("done"):
+            print(f"[cron] 今日简报已推送，跳过", file=sys.stderr)
+            return
+
+        # Past 15:00 — give up
+        if now_beijing >= cutoff_beijing:
+            print("⚠️ arXiv日报 | 今天已过15:00，arXiv始终未更新。明天再试。")
+            state["done"] = True
+            with open(state_file, "w") as f:
+                json.dump(state, f)
+            return
+
+    # === Check if feed is today ===
+    is_today, feed_date_str = is_feed_today()
+
+    if not is_today:
+        msg = f"⏳ arXiv日报 | arXiv今日数据尚未更新（RSS日期：{feed_date_str or '未知'}），请稍后再试。"
+        if cron_mode:
+            current_hour = now_beijing.hour
+            if current_hour not in state.get("notified_hours", []):
+                next_hour = current_hour + 1
+                if next_hour >= 15:
+                    next_hint = "这是最后一次尝试"
+                else:
+                    next_hint = f"将于{next_hour}:00再次尝试"
+                print(f"⏳ arXiv日报 | arXiv今日数据尚未更新（RSS日期：{feed_date_str or '未知'}），{next_hint}。")
+                state.setdefault("notified_hours", []).append(current_hour)
+                with open(state_file, "w") as f:
+                    json.dump(state, f)
+            else:
+                print(f"[cron] 本小时已通知，跳过", file=sys.stderr)
+        else:
+            print(msg)
+        return
+
+    # === Feed is today — generate briefing ===
+    print(f"  Feed is current ({feed_date_str}), fetching papers...", file=sys.stderr)
+    all_papers = fetch_all_papers()
+
+    if not all_papers:
+        print("⚠️ arXiv日报 | RSS已更新但未找到新论文，可能数据异常。")
+        return
+
+    # Dedup (skip in force mode)
+    reported_ids = load_reported_ids()
+    if force:
+        new_papers = all_papers
+    else:
+        new_papers = [p for p in all_papers if p['id'] not in reported_ids]
+
+    if not new_papers:
+        print("No new papers to report.", file=sys.stderr)
+        return
+
+    print(f"  {len(new_papers)} papers to analyze (total fetched: {len(all_papers)})", file=sys.stderr)
+
+    # LLM analysis in batches
+    batch_size = 12
+    all_analyses = []
+    total_batches = (len(new_papers) + batch_size - 1) // batch_size
+
+    for i in range(0, len(new_papers), batch_size):
+        batch = new_papers[i:i + batch_size]
+        batch_idx = i // batch_size + 1
+        print(f"  Batch {batch_idx}/{total_batches} ({len(batch)} papers)...", file=sys.stderr)
+
+        analyses = classify_batch(batch, batch_idx, total_batches)
+        if analyses and isinstance(analyses, list):
+            for a in analyses:
+                idx = a.get('paper_index', 0) - 1
+                if 0 <= idx < len(batch):
+                    all_analyses.append((batch[idx], a))
+        else:
+            for j, p in enumerate(batch):
+                all_analyses.append((p, {
+                    'tier': 'Tier-4',
+                    'relevance': {d['name']: 0 for d in INTEREST_DOMAINS},
+                    'summary_cn': f"标题：{p['title'][:80]}",
+                }))
+
+    # Filter and format
+    selected = filter_papers(all_analyses)
+    briefing = format_briefing(selected, len(all_papers))
+
+    # Print briefing first, then save state
+    print(briefing)
+
+    # Save IDs — only after successful briefing generation!
+    save_reported_ids(reported_ids | {p['id'] for p in new_papers})
+
+    # Mark done (cron mode)
+    if cron_mode:
+        state["done"] = True
+        with open(state_file, "w") as f:
+            json.dump(state, f)
+
+
+if __name__ == "__main__":
+    main()
