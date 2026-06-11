@@ -57,10 +57,38 @@ If an endpoint fails, it auto-demotes to the next. If you don't have the proxy r
 ## Configuration
 
 Edit `scripts/arxiv_daily_briefing.py`:
-- `LLM_ENDPOINTS` — add/modify your LLM backends (line ~33)
-- `RSS_FEEDS` — change which arXiv categories to monitor (line ~64)
-- `DETECTOR_KEYWORDS_PATTERNS` — adjust keyword filters (line ~74)
-- `INTEREST_DOMAINS` — customize domains and weights (line ~90)
+
+- `RSS_FEEDS` (~line 64) — arXiv categories to monitor
+- `DETECTOR_KEYWORDS_PATTERNS` (~line 74) — keyword filters for detector feeds
+- `INTEREST_DOMAINS` (~line 90) — your research interests (see below)
+
+### Customizing Interest Domains
+
+Each domain has a `name`, `tag` (emoji label in output), `weight` (multiplier), and a list of `keywords` (matched case-insensitively against title + abstract):
+
+```python
+INTEREST_DOMAINS = [
+    {"name": "超导探测器及其读出技术", "tag": "🔬超导探测器", "weight": 5,
+     "keywords": ["superconducting detector", "transition-edge sensor", ...]},
+    {"name": "弥散热气体",                   "tag": "🌫️热气体",    "weight": 4,
+     "keywords": ["warm-hot igm", "circumgalactic medium", ...]},
+    # ... add/remove/modify domains here
+]
+```
+
+To change interests:
+1. Edit the `INTEREST_DOMAINS` list — add, remove, or reorder domains
+2. Adjust `weight` values to change priority (higher = more papers from that domain selected)
+3. Update `keywords` to match your field's terminology
+4. The LLM classification prompt is auto-generated from this list — no other changes needed
+
+Example — adding a new domain:
+```python
+{"name": "快速射电暴", "tag": "📡FRB", "weight": 4,
+ "keywords": ["fast radio burst", "FRB", "radio transient", "CHIME", "repeating FRB"]},
+```
+
+- `LLM_ENDPOINTS` (~line 33) — add/modify your LLM backends
 
 ## Usage Modes
 

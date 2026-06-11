@@ -57,10 +57,37 @@ python3 scripts/arxiv_daily_briefing.py --force
 
 编辑 `scripts/arxiv_daily_briefing.py`：
 
-- `LLM_ENDPOINTS`（~33 行）— 添加/修改你的 LLM 后端
-- `RSS_FEEDS`（~64 行）— 修改要监控的 arXiv 分类
-- `DETECTOR_KEYWORDS_PATTERNS`（~74 行）— 调整关键词过滤
-- `INTEREST_DOMAINS`（~90 行）— 自定义兴趣领域和权重
+- `RSS_FEEDS`（~64 行）— 要监控的 arXiv 分类
+- `DETECTOR_KEYWORDS_PATTERNS`（~74 行）— 探测器关键词过滤
+- `INTEREST_DOMAINS`（~90 行）— 你的研究兴趣（见下方详细说明）
+
+### 自定义兴趣领域
+
+每个领域包含 `name`（名称）、`tag`（输出中的 emoji 标签）、`weight`（权重倍数）和 `keywords` 列表（对标题和摘要做不区分大小写的匹配）：
+
+```python
+INTEREST_DOMAINS = [
+    {"name": "超导探测器及其读出技术", "tag": "🔬超导探测器", "weight": 5,
+     "keywords": ["superconducting detector", "transition-edge sensor", ...]},
+    {"name": "弥散热气体",             "tag": "🌫️热气体",    "weight": 4,
+     "keywords": ["warm-hot igm", "circumgalactic medium", ...]},
+    # ... 在这里增删改领域
+]
+```
+
+修改步骤：
+1. 编辑 `INTEREST_DOMAINS` 列表 — 添加、删除或重新排序领域
+2. 调整 `weight` 值改变优先级（权重越高，该领域论文越容易被选中）
+3. 更新 `keywords` 匹配你领域的关键术语
+4. LLM 分类 prompt 由此列表自动生成 — 无需其他改动
+
+示例 — 添加一个新领域：
+```python
+{"name": "快速射电暴", "tag": "📡FRB", "weight": 4,
+ "keywords": ["fast radio burst", "FRB", "radio transient", "CHIME", "repeating FRB"]},
+```
+
+- `LLM_ENDPOINTS`（~33 行）— 添加/修改 LLM 后端
 
 ## 运行模式
 
