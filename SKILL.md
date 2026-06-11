@@ -1,6 +1,6 @@
 ---
 name: arxiv
-description: Search and retrieve academic papers from arXiv. Includes a daily briefing system for astrophysics and superconducting detector papers with LLM-powered classification.
+description: Search and retrieve academic papers from arXiv. Includes Arxiv Daily Recommend — personalized daily briefing for astrophysics and superconducting detector papers with LLM-powered classification.
 version: 1.1.0
 author: Hermes Agent
 license: MIT
@@ -10,11 +10,11 @@ metadata:
     related_skills: [ocr-and-documents]
 ---
 
-# arXiv Research & Daily Briefing
+# arXiv Research & Arxiv Daily Recommend
 
-Two-in-one skill: (1) General arXiv paper search API, and (2) a personalized daily briefing generator for astrophysics + superconducting detectors.
+Two-in-one skill: (1) General arXiv paper search API, and (2) Arxiv Daily Recommend — personalized daily briefing for astrophysics + superconducting detectors.
 
-## 🚀 Daily Briefing
+## 🚀 Arxiv Daily Recommend
 
 Generates a personalized arXiv daily briefing covering astro-ph, physics.ins-det, and cond-mat.supr-con. Papers are classified into 4 importance tiers and scored against 5 interest domains with configurable weights.
 

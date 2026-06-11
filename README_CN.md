@@ -1,4 +1,4 @@
-# arXiv 每日简报
+# Arxiv Daily Recommend
 
 [![English](https://img.shields.io/badge/English-README-blue)](README.md)
 

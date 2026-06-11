@@ -1,4 +1,4 @@
-# arXiv Daily Briefing
+# Arxiv Daily Recommend
 
 [![中文](https://img.shields.io/badge/中文-README_CN-blue)](README_CN.md)
 
