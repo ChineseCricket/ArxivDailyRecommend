@@ -1,4 +1,69 @@
+# ── Python ───────────────────────────────────────────────
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+wheels/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Test / coverage artifacts
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.nox/
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ── Secrets & credentials (NEVER commit to a public repo) ─
 .env
+.env.*
+*.key
+*.pem
+*.crt
+secrets.json
+credentials.json
+*_token.json
+oauth*.json
+
+# ── Editor / IDE ─────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.fleet/
+.history/
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+Desktop.ini
+
+# ── Logs & runtime cache ─────────────────────────────────
+*.log
+logs/
+.cache/
+*.tmp
+*.bak
