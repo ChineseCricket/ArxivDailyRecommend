@@ -67,3 +67,10 @@ logs/
 .cache/
 *.tmp
 *.bak
+
+# ── Internal incident/debug records (not for public release) ─
+# These are private operational notes (cron timeout, proxy architecture,
+# deployment-specific failures). Kept locally for reference, excluded from
+# the public repo. daily-briefing.md and historical-briefing.md are kept.
+references/arxiv-briefing-*.md
+references/cron-prompt-discipline.md
