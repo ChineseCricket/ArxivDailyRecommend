@@ -74,3 +74,4 @@ logs/
 # the public repo. daily-briefing.md and historical-briefing.md are kept.
 references/arxiv-briefing-*.md
 references/cron-prompt-discipline.md
+references/internal-ops.md
