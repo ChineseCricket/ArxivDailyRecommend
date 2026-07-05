@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """arXiv Daily Briefing — Astrophysics & Superconducting Detectors
 Uses RSS feeds for reliable data fetching, LLM for classification.
-Falls back through: proxy → z.ai → DeepSeek (each with 30s timeout).
+Primary: LLM Proxy combo/steady-fallback (handles model routing internally).
+Fallback: DeepSeek direct (if proxy process is completely down).
 """
 
 import urllib.request
@@ -26,36 +27,35 @@ if _dotenv.exists():
 # === Configuration ===
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# LLM endpoints (tried in order)
-# Endpoint priority: proxy first (free NVIDIA NIM when alive), then z.ai, then DeepSeek (paid).
-# The adaptive mechanism in classify_batch() will demote proxy to last if it times out,
-# so NVIDIA-dead days only sacrifice ONE batch (~30s) instead of all batches (~5min).
+# LLM endpoints: proxy virtual models in reliability order.
+# nim-large (fast hedge) → nim-fusion (fan-out+judge, for if large produces bad JSON).
+# DeepSeek only as last-resort if proxy is completely unreachable.
 LLM_ENDPOINTS = [
     {
-        "name": "Waterfall Proxy",
+        "name": "LLM Proxy (nim-large)",
         "url": "http://localhost:18900/v1/chat/completions",
-        "key": None,  # Proxy handles auth internally
-        "model": "moonshotai/kimi-k2.6",
+        "key": None,
+        "model": "nim-large",
     },
     {
-        "name": "DeepSeek",
+        "name": "LLM Proxy (nim-fusion)",
+        "url": "http://localhost:18900/v1/chat/completions",
+        "key": None,
+        "model": "nim-fusion",
+    },
+    {
+        "name": "DeepSeek (proxy-down fallback)",
         "url": "https://api.deepseek.com/v1/chat/completions",
-        "key": os.environ.get("DEEPSEEK_API_KEY") or "sk-YOUR_DEEPSEEK_KEY_HERE",
+        "key": os.environ.get("DEEPSEEK_API_KEY") or "sk-YOU...HERE",
         "model": "deepseek-v4-pro",
-    },
-    {
-        "name": "z.ai GLM-5-turbo",
-        "url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
-        "key": os.environ.get("GLM_API_KEY") or "YOUR_GLM_KEY_HERE",
-        "model": "glm-5-turbo",
     },
 ]
 
-# Adaptive endpoint ordering — modified at runtime by the probe mechanism.
-# Starts as [0,1,2] (proxy first). If proxy times out on first batch,
-# demoted to [1,2,0] (z.ai → DeepSeek → proxy) for remaining batches.
+# Sequential fallback: nim-large (fast & structured) → nim-fusion (reliable JSON)
+# → DeepSeek (paid, only if proxy is completely dead).
+# The demotion mechanism auto-skips endpoints that produce malformed JSON.
 _endpoint_order = list(range(len(LLM_ENDPOINTS)))
-_first_demoted = False
+_demoted = set()  # endpoint indices that failed and should be skipped
 MAX_RETRIES = 3
 RETRY_INTERVAL = 3600  # 1 hour
 CACHE_DIR = os.path.expanduser("~/.hermes/cron/arxiv_briefing")
@@ -123,17 +123,48 @@ INTEREST_DOMAINS = [
 
 
 def fetch_rss_feed(category):
-    """Fetch and parse an arXiv RSS feed."""
-    url = f"https://export.arxiv.org/rss/{category}"
-    req = urllib.request.Request(url, headers={"User-Agent": "arxiv-daily-briefing/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8")
+    """Fetch and parse an arXiv RSS feed, trying multiple front-end hosts.
+
+    arXiv exposes two RSS front-ends that occasionally fall out of sync:
+      - rss.arxiv.org    (primary, currently reliable)
+      - export.arxiv.org (legacy; has returned an empty channel — correctly
+        dated but with zero <item>s — during outages, e.g. late June 2026)
+    We try each host and return the first response that actually contains
+    items. If every host returns an empty channel we return the last one so
+    the caller can still read channel metadata (pubDate) for date checks."""
+    hosts = [
+        f"https://rss.arxiv.org/rss/{category}",
+        f"https://export.arxiv.org/rss/{category}",
+    ]
+    last_xml = ""
+    for url in hosts:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "arxiv-daily-briefing/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                xml_data = resp.read().decode("utf-8")
+            if xml_data.count("<item") > 0:
+                return xml_data
+            last_xml = xml_data
+        except Exception:
+            continue
+    return last_xml
 
 
 def parse_rss_items(xml_data, feed_category, keyword_filter=False):
     """Parse RSS items into paper dicts. Optionally filter by detector keywords."""
     root = ET.fromstring(xml_data)
     papers = []
+
+    # Extract channel pubDate YYMM for ID cross-validation
+    feed_yyyymm = None
+    chan_pub = root.find('.//pubDate')
+    if chan_pub is not None and chan_pub.text:
+        try:
+            from email.utils import parsedate_to_datetime
+            _fdt = parsedate_to_datetime(chan_pub.text.strip())
+            feed_yyyymm = _fdt.strftime("%y%m")
+        except Exception:
+            pass
 
     for item in root.findall('.//item'):
         title = item.find('title').text.strip().replace('\n', ' ')
@@ -146,14 +177,19 @@ def parse_rss_items(xml_data, feed_category, keyword_filter=False):
             continue
         base_id = arxiv_id.split('v')[0]
 
-        # Determine announce type
+        # YYMM cross-validation: ID submission month should match feed month (+/-1)
+        if feed_yyyymm:
+            _id_ym = re.match(r'^(\d{4})\.', base_id)
+            if _id_ym and not _yyyymm_close(_id_ym.group(1), feed_yyyymm, tolerance=1):
+                print(f"    [YYMM] Skip {base_id}: ID month {_id_ym.group(1)} vs feed {feed_yyyymm}", file=sys.stderr)
+                continue
+
+        # Determine announce type from dedicated XML element
+        # (more robust than parsing description text)
         announce_type = 'other'
-        if 'Announce Type: new' in desc:
-            announce_type = 'new'
-        elif 'Announce Type: cross' in desc:
-            announce_type = 'cross'
-        elif 'Announce Type: rep' in desc:
-            announce_type = 'replaced'
+        at_elem = item.find('{http://arxiv.org/schemas/atom}announce_type')
+        if at_elem is not None and at_elem.text:
+            announce_type = at_elem.text.strip()
 
         # Only keep new submissions (not cross-listed or replaced)
         if announce_type != 'new':
@@ -214,6 +250,16 @@ def deduplicate(papers):
     return unique
 
 
+def _yyyymm_close(yyyymm_a, yyyymm_b, tolerance=1):
+    """Check if two YYMM strings (e.g. '2606') are within +/- tolerance months."""
+    try:
+        ya, ma = int(yyyymm_a[:2]), int(yyyymm_a[2:4])
+        yb, mb = int(yyyymm_b[:2]), int(yyyymm_b[2:4])
+        return abs((ya * 12 + ma) - (yb * 12 + mb)) <= tolerance
+    except (ValueError, IndexError):
+        return True  # Can't parse — don't block
+
+
 def get_feed_date():
     """Get the publication date (pubDate) from the RSS feed. Returns a datetime in Beijing TZ."""
     try:
@@ -232,7 +278,12 @@ def get_feed_date():
 
 
 def is_feed_today():
-    """Check if the RSS feed contains today's papers (Beijing date)."""
+    """Check if the RSS feed contains today's papers (Beijing date).
+
+    Primary check: pubDate age (0-1 days, accounting for US-Eastern to Beijing offset).
+    YYMM sanity: if pubDate passes but feed YYMM differs from current month by >1,
+    log a diagnostic warning (does not reject — pubDate is authoritative).
+    """
     feed_dt = get_feed_date()
     if feed_dt is None:
         return False, None
@@ -240,14 +291,28 @@ def is_feed_today():
     # arXiv RSS pubDate is US-Eastern midnight (00:00 -0400), which equals
     # Beijing noon of the *previous* day.  Papers actually go live at ~20:00 ET
     # (= ~08:00 Beijing next day), so the RSS date is always 1 day behind
-    # Beijing when papers are fresh.  Accept feed_date == today OR yesterday.
-    is_today = feed_dt.date() >= (now_beijing.date() - timedelta(days=1))
+    # Beijing when papers are fresh.
+    # Allow feed_date == today OR yesterday to account for the timezone offset:
+    # - Before 12:00 Beijing, pubDate still shows yesterday's ET date
+    # - After 12:00 Beijing, pubDate flips to today's ET date
+    # Reject feeds older than 1 day to prevent stale weekend re-delivery.
+    age_days = (now_beijing.date() - feed_dt.date()).days
+    is_today = 0 <= age_days <= 1
+
+    # YYMM sanity check (diagnostic only — pubDate remains authoritative)
+    if is_today:
+        feed_yyyymm = feed_dt.strftime("%y%m")
+        now_yyyymm = now_beijing.strftime("%y%m")
+        if not _yyyymm_close(feed_yyyymm, now_yyyymm, tolerance=1):
+            print(f"  [YYMM] Feed pubDate YYMM ({feed_yyyymm}) differs from current ({now_yyyymm}) by >1 month — possible stale feed", file=sys.stderr)
+
     return is_today, feed_dt.strftime("%Y-%m-%d %H:%M 北京时间")
 
 
 def classify_batch(papers_batch, batch_idx, total_batches):
-    """Send a batch of papers to LLM for classification via multi-endpoint fallback."""
-    global _endpoint_order, _proxy_demoted
+    """Send a batch of papers to LLM for classification.
+    Fallback chain: nim-fusion → nim-large → DeepSeek (paid).
+    Failed endpoints are demoted (skipped) for the rest of the run."""
 
     paper_texts = []
     for i, p in enumerate(papers_batch):
@@ -320,9 +385,13 @@ def classify_batch(papers_batch, batch_idx, total_batches):
         {"role": "user", "content": prompt}
     ]
 
-    # Try endpoints in current _endpoint_order with 60s timeout each
-    global _first_demoted, _endpoint_order
+    # Fallback chain: nim-fusion → nim-large → DeepSeek.
+    # Endpoints in _demoted are skipped for the rest of the run to avoid
+    # re-paying timeout penalties.  Proxy endpoints (idx 0,1) get 300s
+    # (cron runs in background); DeepSeek (idx 2) gets 90s (direct, paid).
     for ep_idx in _endpoint_order:
+        if ep_idx in _demoted:
+            continue
         endpoint = LLM_ENDPOINTS[ep_idx]
         payload = {
             "model": endpoint["model"],
@@ -342,7 +411,8 @@ def classify_batch(papers_batch, batch_idx, total_batches):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            call_timeout = 300 if ep_idx < 2 else 90  # proxy=300s, deepseek=90s
+            with urllib.request.urlopen(req, timeout=call_timeout) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
             content = result['choices'][0]['message']['content'].strip()
             for prefix in ("```json", "```"):
@@ -352,18 +422,13 @@ def classify_batch(papers_batch, batch_idx, total_batches):
                 content = content.rsplit("```", 1)[0]
             parsed = json.loads(content.strip())
             print(f"    → {endpoint['name']} OK", file=sys.stderr)
-            return parsed
+            return parsed, endpoint['name']
         except Exception as e:
             print(f"    → {endpoint['name']} failed: {e}", file=sys.stderr)
-            # If the first-priority endpoint fails, demote it to last 
-            # for remaining batches (adaptive fallback)
-            if ep_idx == 0 and not _first_demoted:
-                _endpoint_order = _endpoint_order[1:] + [0]
-                _first_demoted = True
-                print(f"    → {endpoint['name']} demoted to last priority for remaining batches", file=sys.stderr)
+            _demoted.add(ep_idx)  # skip this endpoint for the rest of the run
             continue
 
-    return None
+    return None, None
 
 
 def compute_weighted_score(analysis):
@@ -405,7 +470,7 @@ def filter_papers(papers_with_analysis):
     return selected
 
 
-def format_briefing(selected, total_fetched):
+def format_briefing(selected, total_fetched, endpoint_stats=None):
     """Format the final markdown briefing."""
     now_bj = datetime.now(BEIJING_TZ)
     date_str = now_bj.strftime("%Y-%m-%d")
@@ -453,6 +518,21 @@ def format_briefing(selected, total_fetched):
                     if a.get('relevance', {}).get(domain['name'], 0) >= 2)
         if count > 0:
             lines.append(f"  {domain['name']}: {count} 篇")
+
+    # LLM endpoint usage footer
+    if endpoint_stats:
+        total_batches = sum(endpoint_stats.values())
+        parts = []
+        # Ordered: Waterfall Proxy, DeepSeek, z.ai
+        for ep in LLM_ENDPOINTS:
+            name = ep["name"]
+            count = endpoint_stats.get(name, 0)
+            if count > 0:
+                pct = count * 100 // total_batches
+                parts.append(f"{name} {count}/{total_batches}批({pct}%)")
+        if parts:
+            lines.append("")
+            lines.append(f"⚡ LLM分类: {' · '.join(parts)}")
 
     return "\n".join(lines)
 
@@ -569,18 +649,48 @@ def main():
     all_papers = fetch_all_papers()
 
     if not all_papers:
-        print("⚠️ arXiv日报 | RSS已更新但未找到新论文，可能数据异常。")
+        # Feed is dated "today" but every host returned zero items. arXiv
+        # essentially never has a genuinely empty new-submission day, so this
+        # is almost certainly a front-end RSS outage rather than "no papers".
+        # Notify the user ONCE, then stay silent for the rest of the day so
+        # we don't repeat the same warning every hour.
+        if cron_mode:
+            if not state.get("empty_notified"):
+                print("⚠️ arXiv日报 | 今日RSS源返回空（疑似arXiv端临时故障），已尝试备用源仍未获取到数据，将在下个整点重试。")
+                state["empty_notified"] = True
+                with open(state_file, "w") as f:
+                    json.dump(state, f)
+            else:
+                print("[cron] RSS空通知已发送，本小时跳过", file=sys.stderr)
+        else:
+            print("⚠️ arXiv日报 | RSS源返回空，疑似arXiv端故障，请稍后重试。")
         return
 
-    # Dedup (skip in force mode)
-    reported_ids = load_reported_ids()
+    # Dedup — cross-day: check today + past 7 days to prevent re-delivery
+    today_reported_ids = load_reported_ids()
+    # Load past 7 days' reported IDs for cross-day dedup (separate from today's save)
+    cross_day_ids = set()
+    for days_ago in range(1, 8):
+        past_date = (now_beijing - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        past_file = os.path.join(CACHE_DIR, f"reported_ids_{past_date}.json")
+        if os.path.exists(past_file):
+            try:
+                with open(past_file) as f:
+                    cross_day_ids |= set(json.load(f))
+            except Exception:
+                pass
+    all_reported_ids = today_reported_ids | cross_day_ids
     if force:
         new_papers = all_papers
     else:
-        new_papers = [p for p in all_papers if p['id'] not in reported_ids]
+        new_papers = [p for p in all_papers if p['id'] not in all_reported_ids]
 
     if not new_papers:
-        print("No new papers to report.", file=sys.stderr)
+        print("📭 arXiv日报 | 今日扫描完成，无符合条件的新论文（已通过跨日去重过滤）。")
+        if cron_mode:
+            state["done"] = True
+            with open(state_file, "w") as f:
+                json.dump(state, f)
         return
 
     print(f"  {len(new_papers)} papers to analyze (total fetched: {len(all_papers)})", file=sys.stderr)
@@ -588,6 +698,7 @@ def main():
     # LLM analysis in batches
     batch_size = 12
     all_analyses = []
+    endpoint_stats = {}  # Track which LLM endpoint handled each batch
     total_batches = (len(new_papers) + batch_size - 1) // batch_size
 
     for i in range(0, len(new_papers), batch_size):
@@ -595,7 +706,9 @@ def main():
         batch_idx = i // batch_size + 1
         print(f"  Batch {batch_idx}/{total_batches} ({len(batch)} papers)...", file=sys.stderr)
 
-        analyses = classify_batch(batch, batch_idx, total_batches)
+        analyses, ep_name = classify_batch(batch, batch_idx, total_batches)
+        if ep_name:
+            endpoint_stats[ep_name] = endpoint_stats.get(ep_name, 0) + 1
         if analyses and isinstance(analyses, list):
             for a in analyses:
                 idx = a.get('paper_index', 0) - 1
@@ -611,13 +724,13 @@ def main():
 
     # Filter and format
     selected = filter_papers(all_analyses)
-    briefing = format_briefing(selected, len(all_papers))
+    briefing = format_briefing(selected, len(all_papers), endpoint_stats)
 
     # Print briefing first, then save state
     print(briefing)
 
-    # Save IDs — only after successful briefing generation!
-    save_reported_ids(reported_ids | {p['id'] for p in new_papers})
+    # Save IDs — only today's new papers, not the cross-day union
+    save_reported_ids(today_reported_ids | {p['id'] for p in new_papers})
 
     # Mark done (cron mode)
     if cron_mode:
