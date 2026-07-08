@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """arXiv Daily Briefing — Astrophysics & Superconducting Detectors
 Uses RSS feeds for reliable data fetching, LLM for classification.
-Primary: LLM Proxy combo/steady-fallback (handles model routing internally).
-Fallback: DeepSeek direct (if proxy process is completely down).
+Primary: LLM Proxy nim-fusion (fan-out + judge for quality).
+Fallback: nim-large hedge → z.ai GLM-5.2 direct (Hermes main model).
 """
 
 import urllib.request
@@ -28,15 +28,9 @@ if _dotenv.exists():
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # LLM endpoints: proxy virtual models in reliability order.
-# nim-large (fast hedge) → nim-fusion (fan-out+judge, for if large produces bad JSON).
-# DeepSeek only as last-resort if proxy is completely unreachable.
+# nim-fusion (quality first: fan-out + judge) → nim-large (fast hedge fallback)
+# → z.ai GLM-5.2 direct (only if proxy is completely unreachable).
 LLM_ENDPOINTS = [
-    {
-        "name": "LLM Proxy (nim-large)",
-        "url": "http://localhost:18900/v1/chat/completions",
-        "key": None,
-        "model": "nim-large",
-    },
     {
         "name": "LLM Proxy (nim-fusion)",
         "url": "http://localhost:18900/v1/chat/completions",
@@ -44,15 +38,21 @@ LLM_ENDPOINTS = [
         "model": "nim-fusion",
     },
     {
-        "name": "DeepSeek (proxy-down fallback)",
-        "url": "https://api.deepseek.com/v1/chat/completions",
-        "key": os.environ.get("DEEPSEEK_API_KEY") or "sk-YOU...HERE",
-        "model": "deepseek-v4-pro",
+        "name": "LLM Proxy (nim-large)",
+        "url": "http://localhost:18900/v1/chat/completions",
+        "key": None,
+        "model": "nim-large",
+    },
+    {
+        "name": "z.ai GLM-5.2 (direct fallback)",
+        "url": (os.environ.get("GLM_BASE_URL") or "https://open.bigmodel.cn/api/coding/paas/v4") + "/chat/completions",
+        "key": os.environ.get("Z_AI_API_KEY"),
+        "model": "glm-5.2",
     },
 ]
 
-# Sequential fallback: nim-large (fast & structured) → nim-fusion (reliable JSON)
-# → DeepSeek (paid, only if proxy is completely dead).
+# Sequential fallback: nim-fusion (quality, fan-out+judge) → nim-large (fast hedge)
+# → z.ai GLM-5.2 (Hermes main model, only if proxy is completely dead).
 # The demotion mechanism auto-skips endpoints that produce malformed JSON.
 _endpoint_order = list(range(len(LLM_ENDPOINTS)))
 _demoted = set()  # endpoint indices that failed and should be skipped
@@ -385,10 +385,10 @@ def classify_batch(papers_batch, batch_idx, total_batches):
         {"role": "user", "content": prompt}
     ]
 
-    # Fallback chain: nim-fusion → nim-large → DeepSeek.
+    # Fallback chain: nim-fusion → nim-large → z.ai GLM-5.2.
     # Endpoints in _demoted are skipped for the rest of the run to avoid
-    # re-paying timeout penalties.  Proxy endpoints (idx 0,1) get 300s
-    # (cron runs in background); DeepSeek (idx 2) gets 90s (direct, paid).
+    # re-paying timeout penalties.  Proxy endpoints (idx 0,1) get 380s
+    # (matches nim-fusion's 360s hard_timeout + margin); z.ai (idx 2) gets 90s.
     for ep_idx in _endpoint_order:
         if ep_idx in _demoted:
             continue
@@ -411,7 +411,7 @@ def classify_batch(papers_batch, batch_idx, total_batches):
         )
 
         try:
-            call_timeout = 300 if ep_idx < 2 else 90  # proxy=300s, deepseek=90s
+            call_timeout = 380 if ep_idx < 2 else 90  # proxy=380s, z.ai=90s
             with urllib.request.urlopen(req, timeout=call_timeout) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
             content = result['choices'][0]['message']['content'].strip()
